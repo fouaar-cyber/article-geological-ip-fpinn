@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.pip-log.txt
+
+# Data files (too large for Git)
+data/
+*.npy
+*.h5
+
+# Results (you can commit these if small)
+results/
+
+#IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
