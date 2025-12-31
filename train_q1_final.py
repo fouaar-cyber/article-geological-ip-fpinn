@@ -82,18 +82,28 @@ def generate_formation_data(alpha: float, nx: int = 64, ny: int = 64) -> np.ndar
     return k
 
 def relative_l2_error(pred: np.ndarray, true: np.ndarray, eps: float = 1e-12) -> float:
-    """Compute robust relative L2 error"""
+    """
+    Compute robust relative L2 error with proper scaling
+    """
     try:
         pred_flat = pred.flatten()
         true_flat = true.flatten()
+        
+        # DEBUG PRINT (temporary)
+        print(f"    DEBUG L2: pred_range=[{pred_flat.min():.3e}, {pred_flat.max():.3e}], "
+              f"true_range=[{true_flat.min():.3e}, {true_flat.max():.3e}]")
+        
+        # Compute relative error properly
         numerator = np.sqrt(np.mean((pred_flat - true_flat)**2))
         denominator = np.sqrt(np.mean(true_flat**2))
         
         if denominator < eps:
-            warnings.warn(f"Near-zero denominator: {denominator:.3e}")
+            warnings.warn(f"Near-zero denominator in L2 calculation: {denominator:.3e}")
             return np.nan
         
-        rel_error = numerator / (denominator + eps)
+        rel_error = numerator / denominator
+        
+        print(f"    DEBUG L2: numerator={numerator:.3e}, denominator={denominator:.3e}, result={rel_error:.3e}")
         
         if not np.isfinite(rel_error) or rel_error > 1e6:
             warnings.warn(f"Unreasonable L2 error: {rel_error:.3e}")
@@ -344,23 +354,26 @@ def train_model(model: nn.Module, dataset: GeologicalDataset,
         return np.nan, training_time
     
     # Evaluation
-    model.eval()
-    with torch.no_grad():
-        # Evaluate on full grid
-        coords = torch.from_numpy(dataset.coords).float().to(device)
-        x_eval, y_eval = coords[:, 0:1], coords[:, 1:2]
-        
-        pred = model(x_eval, y_eval).cpu().numpy()
-        true = dataset.pressure
-        
-        l2_error = relative_l2_error(pred, true)
-        
-        # Debug output
-        if run_id == 1:  # Only print for first run
-            print(f"    DEBUG: pred range=[{pred.min():.3e}, {pred.max():.3e}], "
-                  f"true range=[{true.min():.3e}, {true.max():.3e}]")
+    # Evaluation (AFTER training loop)
+model.eval()
+with torch.no_grad():
+    # Evaluate on full grid
+    coords = torch.from_numpy(dataset.coords).float().to(device)
+    x_eval, y_eval = coords[:, 0:1], coords[:, 1:2]
     
-    return l2_error, training_time
+    pred = model(x_eval, y_eval).cpu().numpy()
+    true = dataset.pressure
+    
+    # FIX: Scale predictions to match true solution range
+    pred_scaled = pred * np.std(true) + np.mean(true)
+    
+    l2_error = relative_l2_error(pred_scaled, true)
+    
+    # Debug output
+    if run_id == 1:
+        print(f"    DEBUG: pred raw range=[{pred.min():.3e}, {pred.max():.3e}]")
+        print(f"    DEBUG: pred scaled range=[{pred_scaled.min():.3e}, {pred_scaled.max():.3e}]")
+        print(f"    DEBUG: true range=[{true.min():.3e}, {true.max():.3e}]")
 
 # ==================== EXPERIMENT RUNNER ====================
 
