@@ -23,3 +23,11 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+debug_plots_enhanced/
+*.aux
+*.log
+*.blg
+*.out
+*.synctex.gz
+*.docx
+Nouveau*.txt
