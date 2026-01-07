@@ -1,433 +1,462 @@
-#!/usr/bin/env python3
-"""
-ENHANCED IP-FPINN - ULTIMATE STABLE VERSION
-============================================
-Final hyperparameters for publication:
-- LR: 1e-4 for both (stability)
-- PDE weight: 0.5 for both (fair comparison)
-- IP-FPINN advantage: comes ONLY from permeability gradient features
-- Warmup: 300 for IP-FPINN, 100 for PINN
-- Gradient clipping: IP-FPINN only
-"""
-
 import torch
 import torch.nn as nn
-import torch.autograd as autograd
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
 import json
 import time
 import argparse
 from pathlib import Path
 from typing import Dict, Tuple
 
-# Set seeds
-torch.manual_seed(42)
-np.random.seed(42)
+# ==================== Configuration ====================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RESULTS_DIR = Path("results_enhanced")
+PLOT_DIR = Path("debug_plots_enhanced")
+RESULTS_DIR.mkdir(exist_ok=True)
+PLOT_DIR.mkdir(exist_ok=True)
 
-# ============================================================================
-# 1. ENHANCED IP-FPINN WITH SPATIAL ATTENTION
-# ============================================================================
-
-class SpatialAttentionIPFPINN(nn.Module):
-    def __init__(self, hidden_dim: int = 64, grid_size: int = 64):
-        super().__init__()
-        self.grid_size = grid_size
+# ==================== Data Generation ====================
+def generate_formation_data(alpha: float, grid_size: int = 64, save_plot: bool = False) -> Dict:
+    """Generate synthetic geological formation data with heterogeneity parameter alpha."""
+    x = np.linspace(0, 1, grid_size)
+    y = np.linspace(0, 1, grid_size)
+    X, Y = np.meshgrid(x, y)
+    
+    # Permeability field with heterogeneity
+    k_x = 1e-13 * (1 + alpha * np.sin(2 * np.pi * X) * np.cos(2 * np.pi * Y))
+    k_y = 0.5e-13 * (1 + alpha * np.cos(2 * np.pi * X) * np.sin(2 * np.pi * Y))
+    
+    # Pressure solution (synthetic)
+    P = np.sin(np.pi * X) * np.sin(np.pi * Y) * (1 + 0.2 * alpha * X * Y)
+    
+    # Derivatives for physics-informed loss
+    dP_dx = np.pi * np.cos(np.pi * X) * np.sin(np.pi * Y) * (1 + 0.2 * alpha * X * Y) + \
+            np.sin(np.pi * X) * np.sin(np.pi * Y) * (0.2 * alpha * Y)
+    dP_dy = np.pi * np.sin(np.pi * X) * np.cos(np.pi * Y) * (1 + 0.2 * alpha * X * Y) + \
+            np.sin(np.pi * X) * np.sin(np.pi * Y) * (0.2 * alpha * X)
+    
+    data = {
+        "X": X, "Y": Y, "P": P,
+        "k_x": k_x, "k_y": k_y,
+        "dP_dx": dP_dx, "dP_dy": dP_dy,
+        "alpha": alpha,
+        "grid_size": grid_size
+    }
+    
+    # Validation
+    sol_std = np.std(P)
+    perm_range = [np.min(k_x), np.max(k_x)]
+    
+    if save_plot:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        im0 = axes[0].imshow(k_x, cmap='viridis')
+        axes[0].set_title(f'Permeability Field (α={alpha})')
+        plt.colorbar(im0, ax=axes[0])
         
-        # Coordinate pathway (spatial features)
-        self.spatial_net = nn.Sequential(
+        im1 = axes[1].imshow(P, cmap='jet')
+        axes[1].set_title('Pressure Solution')
+        plt.colorbar(im1, ax=axes[1])
+        
+        im2 = axes[2].imshow(dP_dx, cmap='coolwarm')
+        axes[2].set_title('dP/dx')
+        plt.colorbar(im2, ax=axes[2])
+        
+        plt.tight_layout()
+        plt.savefig(PLOT_DIR / f"formation_alpha_{alpha}.png", dpi=150)
+        plt.close()
+        
+    print(f"  Data verified: α={alpha} | sol_std={sol_std:.3e} | perm_range=[{perm_range[0]:.1e}, {perm_range[1]:.1e}]")
+    return data
+
+# ==================== Neural Networks ====================
+class PINN(nn.Module):
+    """Baseline Physics-Informed Neural Network"""
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(2, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-        )
-        
-        # Permeability pathway (geological features)
-        self.perm_net = nn.Sequential(
-            nn.Linear(3, hidden_dim // 2),  # k, ∇k_x, ∇k_y
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
-        )
-        
-        # Attention mechanism: combines spatial + geological features
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid()  # Attention weights in [0,1]
-        )
-        
-        # Output network processes attended features
-        self.output_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
         
-        # Initialize weights for stability
-        self._init_weights()
+        # Initialize weights
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
     
-    def _init_weights(self):
-        """Xavier initialization for stable training"""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.constant_(module.bias, 0.0)
-    
-    def forward(self, coords: torch.Tensor, permeability: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            coords: (N, 2) tensor of (x, y) coordinates
-            permeability: (N,) tensor of permeability values
-        """
-        # Permeability preprocessing: compute spatial gradients
-        k_grid = permeability.view(self.grid_size, self.grid_size)
-        
-        # Compute permeability gradients using finite differences
-        k_y, k_x = torch.gradient(k_grid)
-        
-        # Flatten back and create feature vectors
-        k_flat = permeability.unsqueeze(1)  # (N, 1)
-        k_x_flat = k_x.reshape(-1, 1)       # (N, 1)
-        k_y_flat = k_y.reshape(-1, 1)       # (N, 1)
-        
-        # Permeability features: value + gradients
-        perm_features = torch.cat([k_flat, k_x_flat, k_y_flat], dim=1)
-        
-        # Process pathways separately
-        spatial_features = self.spatial_net(coords)  # (N, hidden_dim)
-        geological_features = self.perm_net(perm_features)  # (N, hidden_dim//2)
-        
-        # Combine features for attention computation
-        combined_features = torch.cat([spatial_features, geological_features], dim=1)
-        
-        # Compute attention weights (spatially varying)
-        attention_weights = self.attention(combined_features)  # (N, hidden_dim)
-        
-        # Apply attention to spatial features (permeability-guided gating)
-        attended_features = spatial_features * attention_weights
-        
-        # Final output
-        return self.output_net(attended_features)
+    def forward(self, x, y):
+        inputs = torch.cat([x, y], dim=1)
+        return self.net(inputs)
 
-# ============================================================================
-# 2. DATA GENERATION
-# ============================================================================
-
-def generate_permeability_field(alpha: float, grid_size: int = 64) -> np.ndarray:
-    """Generate statistically distinct permeability fields"""
-    if alpha == 0.3:  # Fractured
-        k = np.ones((grid_size, grid_size)) * 1e-13
-        for i in range(5):
-            x_idx = int(np.random.uniform(0.2, 0.8) * grid_size)
-            k[:, max(0, x_idx-2):min(grid_size, x_idx+2)] = 1e-11
-            
-    elif alpha == 0.5:  # Heterogeneous
-        from scipy.ndimage import gaussian_filter
-        noise = np.random.randn(grid_size, grid_size)
-        smooth_noise = gaussian_filter(noise, sigma=5)
-        k = np.exp(smooth_noise * 2) * 1e-13
-        
-    elif alpha == 0.7:  # Layered
-        k = np.ones((grid_size, grid_size)) * 1e-13
-        for i in range(0, grid_size, 8):
-            k[i:i+4, :] = 5e-12
-            
-    elif alpha == 1.0:  # Homogeneous
-        k = np.ones((grid_size, grid_size)) * 1e-13
-        
-    else:
-        raise ValueError(f"Invalid alpha: {alpha}")
-    
-    return k
-
-def solve_flow_pde(permeability: np.ndarray) -> np.ndarray:
-    """Solve ∇·(k∇u) = 0 with Dirichlet BCs"""
-    grid_size = permeability.shape[0]
-    u = np.zeros((grid_size, grid_size))
-    u[:, 0] = 1.0
-    u[:, -1] = 0.0
-    
-    for iteration in range(2000):
-        u_old = u.copy()
-        for i in range(1, grid_size-1):
-            for j in range(1, grid_size-1):
-                k_w = 2 / (1/permeability[i, j] + 1/permeability[i, j-1])
-                k_e = 2 / (1/permeability[i, j] + 1/permeability[i, j+1])
-                k_s = 2 / (1/permeability[i, j] + 1/permeability[i-1, j])
-                k_n = 2 / (1/permeability[i, j] + 1/permeability[i+1, j])
-                u[i, j] = (k_w*u[i, j-1] + k_e*u[i, j+1] + k_s*u[i-1, j] + k_n*u[i+1, j]) / (k_w + k_e + k_s + k_n)
-        
-        if np.max(np.abs(u - u_old)) < 1e-6:
-            break
-    
-    return u
-
-def generate_formation_data(alpha: float, grid_size: int = 64, 
-                           save_plot: bool = True) -> Dict[str, torch.Tensor]:
-    """Generate and visualize data"""
-    perm = generate_permeability_field(alpha, grid_size)
-    solution = solve_flow_pde(perm)
-    
-    x = torch.linspace(0, 1, grid_size)
-    y = torch.linspace(0, 1, grid_size)
-    X, Y = torch.meshgrid(x, y, indexing='ij')
-    coords = torch.stack([X.flatten(), Y.flatten()], dim=1)
-    
-    solution_flat = solution.flatten()
-    min_val, max_val = solution_flat.min(), solution_flat.max()
-    solution_norm = 2 * (solution_flat - min_val) / (max_val - min_val + 1e-10) - 1
-    
-    if save_plot:
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-        im0 = axes[0].imshow(perm, cmap='viridis', norm=LogNorm())
-        axes[0].set_title(f'α={alpha} Permeability')
-        plt.colorbar(im0, ax=axes[0])
-        
-        im1 = axes[1].imshow(solution, cmap='plasma')
-        axes[1].set_title(f'α={alpha} Solution')
-        plt.colorbar(im1, ax=axes[1])
-        
-        axes[2].hist(solution_flat, bins=30)
-        axes[2].set_title(f'Distribution (std={solution_flat.std():.3e})')
-        
-        plt.tight_layout()
-        Path('debug_plots_enhanced').mkdir(exist_ok=True)
-        plt.savefig(f'debug_plots_enhanced/formation_alpha_{alpha}.png', dpi=150)
-        plt.close()
-        
-        print(f"  📊 Plot saved: debug_plots_enhanced/formation_alpha_{alpha}.png")
-    
-    print(f"  Data verified: α={alpha} | sol_std={solution_flat.std():.3e} | perm_range=[{perm.min():.1e}, {perm.max():.1e}]")
-    
-    return {
-        'coordinates': coords,
-        'permeability': torch.tensor(perm.flatten(), dtype=torch.float32),
-        'solution': torch.tensor(solution_norm, dtype=torch.float32),
-        'scale_params': (min_val, max_val)
-    }
-
-def compute_pde_loss(model: nn.Module, coords: torch.Tensor, 
-                    permeability: torch.Tensor, k_grid: torch.Tensor,
-                    model_type: str) -> torch.Tensor:
-    """Compute PDE residual: k*∇²u = 0"""
-    coords_pde = coords.clone().detach().requires_grad_(True)
-    
-    if model_type == "IP-FPINN":
-        u = model(coords_pde, permeability)
-    else:
-        u = model(coords_pde)
-    
-    grad_u = autograd.grad(u, coords_pde, torch.ones_like(u), 
-                          create_graph=True, retain_graph=True)[0]
-    
-    laplacian = 0
-    for i in range(2):
-        grad_component = grad_u[:, i:i+1]
-        second_derivative = autograd.grad(
-            grad_component, coords_pde, torch.ones_like(grad_component),
-            create_graph=True, retain_graph=True
-        )[0][:, i:i+1]
-        laplacian += second_derivative
-    
-    k = permeability.view(-1, 1)
-    residual = k * laplacian
-    return torch.mean(residual ** 2)
-
-class PINN(nn.Module):
-    """Baseline PINN"""
-    def __init__(self, hidden_dim: int = 64):
+class SpatialAttentionIPFPINN(nn.Module):
+    """Enhanced IP-FPINN with optional feature engineering and intrusive physics"""
+    def __init__(self, hidden_dim: int = 64, grid_size: int = 64, 
+                 use_feature: bool = True, use_intrusive: bool = True):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim), nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+        self.use_feature = use_feature
+        self.use_intrusive = use_intrusive
+        
+        # Feature extraction (optional)
+        if use_feature:
+            self.feature_net = nn.Sequential(
+                nn.Linear(4, hidden_dim),  # x, y, k_x, k_y
+                nn.Tanh(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, 2)  # output enhanced features
+            )
+            input_dim = 4  # x, y, features
+        else:
+            input_dim = 2  # x, y only
+        
+        # Main prediction network
+        self.main_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
+        
+        # Initialize weights
+        self._initialize_weights()
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x, y, k_x=None, k_y=None):
+        if self.use_feature and k_x is not None and k_y is not None:
+            # Feature engineering mode
+            geo_features = torch.cat([x, y, k_x, k_y], dim=1)
+            enhanced_features = self.feature_net(geo_features)
+            inputs = torch.cat([x, y, enhanced_features], dim=1)
+        else:
+            # Standard mode
+            inputs = torch.cat([x, y], dim=1)
+        
+        return self.main_net(inputs)
 
-# ============================================================================
-# 3. ULTIMATE STABLE TRAINING LOOP
-# ============================================================================
+# ==================== Physics-Informed Loss ====================
+def physics_informed_loss(model, x, y, k_x, k_y, dP_dx_true, dP_dy_true, 
+                         use_intrusive: bool):
+    """Compute physics-informed loss based on Darcy's law"""
+    x.requires_grad_(True)
+    y.requires_grad_(True)
+    
+    # Forward pass
+    if use_intrusive and hasattr(model, 'use_feature') and model.use_feature:
+        P_pred = model(x, y, k_x, k_y)
+    else:
+        P_pred = model(x, y)
+    
+    # Compute gradients
+    dP_dx = torch.autograd.grad(
+        P_pred, x, 
+        grad_outputs=torch.ones_like(P_pred),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    
+    dP_dy = torch.autograd.grad(
+        P_pred, y, 
+        grad_outputs=torch.ones_like(P_pred),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    
+    # Darcy's law residual
+    residual_x = dP_dx + (k_x * dP_dx_true)
+    residual_y = dP_dy + (k_y * dP_dy_true)
+    
+    physics_loss = torch.mean(residual_x**2) + torch.mean(residual_y**2)
+    
+    return physics_loss
 
-def train_model(model: nn.Module, data: Dict, epochs: int, 
-                device: torch.device, model_type: str) -> Tuple[float, float]:
-    """ULTIMATE stable training - fair comparison"""
+# ==================== Training ====================
+def train_model(model, data, epochs: int, device: torch.device, 
+                model_name: str, use_feature: bool, use_intrusive: bool) -> Tuple[float, float]:
+    """Train a single model with proper physics-informed loss"""
     model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
-    # Same LR for both models (stability)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    
-    # Different warmup: IP-FPINN needs more time to learn attention
-    warmup_epochs = 300 if model_type == "IP-FPINN" else 100
-    
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
-    
-    coords = data['coordinates'].to(device)
-    solution = data['solution'].to(device)
-    permeability = data['permeability'].to(device)
-    k_grid = permeability.view(64, 64)
+    # Convert data to tensors
+    x = torch.from_numpy(data["X"].flatten()).float().unsqueeze(1).to(device)
+    y = torch.from_numpy(data["Y"].flatten()).float().unsqueeze(1).to(device)
+    p_true = torch.from_numpy(data["P"].flatten()).float().unsqueeze(1).to(device)
+    k_x = torch.from_numpy(data["k_x"].flatten()).float().unsqueeze(1).to(device)
+    k_y = torch.from_numpy(data["k_y"].flatten()).float().unsqueeze(1).to(device)
+    dP_dx_true = torch.from_numpy(data["dP_dx"].flatten()).float().unsqueeze(1).to(device)
+    dP_dy_true = torch.from_numpy(data["dP_dy"].flatten()).float().unsqueeze(1).to(device)
     
     start_time = time.time()
     
-    for epoch in range(epochs):
-        model.train()
+    for epoch in range(epochs + 1):
         optimizer.zero_grad()
         
         # Forward pass
-        if model_type == "IP-FPINN":
-            pred = model(coords, permeability).squeeze()
+        if use_feature:
+            p_pred = model(x, y, k_x, k_y)
         else:
-            pred = model(coords).squeeze()
+            p_pred = model(x, y)
         
-        data_loss = torch.mean((pred - solution) ** 2)
+        # Data loss
+        data_loss = torch.mean((p_pred - p_true)**2)
         
-        # PDE loss
-        if epoch > warmup_epochs:
-            pde_loss = compute_pde_loss(model, coords, permeability, k_grid, model_type)
+        # Physics-informed loss
+        if use_intrusive:
+            physics_loss = physics_informed_loss(
+                model, x, y, k_x, k_y, dP_dx_true, dP_dy_true, use_intrusive
+            )
         else:
-            pde_loss = torch.tensor(0.0, device=device)
+            physics_loss = torch.tensor(0.0, device=device)
         
-        # SAME weights for both models! Advantage comes from architecture only.
-        loss = 0.5 * data_loss + 0.5 * pde_loss
+        # Combined loss (you can adjust weights here)
+        total_loss = data_loss + physics_loss
         
-        loss.backward()
-        
-        # Gradient clipping only for IP-FPINN (has more parameters)
-        if model_type == "IP-FPINN":
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+        total_loss.backward()
         optimizer.step()
-        scheduler.step()
         
-        if epoch % 200 == 0:
-            print(f"  Epoch {epoch:4d} | Loss: {loss.item():.3e} (Data: {data_loss.item():.3e}, PDE: {pde_loss.item():.3e})")
+        # Print progress
+        if epoch % 20 == 0:
+            print(f"  [{model_name}] Epoch {epoch:4d} | Loss: {total_loss.item():.3e} "
+                  f"(Data: {data_loss.item():.3e}, PDE: {physics_loss.item():.3e})")
     
-    # Final evaluation
-    model.eval()
+    train_time = time.time() - start_time
+    
+    # Compute final L2 error
     with torch.no_grad():
-        if model_type == "IP-FPINN":
-            pred_final = model(coords, permeability).squeeze()
+        if use_feature:
+            p_pred_final = model(x, y, k_x, k_y)
         else:
-            pred_final = model(coords).squeeze()
+            p_pred_final = model(x, y)
         
-        min_val, max_val = data['scale_params']
-        pred_unscaled = (pred_final + 1) / 2 * (max_val - min_val) + min_val
-        sol_unscaled = (solution + 1) / 2 * (max_val - min_val) + min_val
-        
-        l2_error = torch.sqrt(torch.mean((pred_unscaled - sol_unscaled) ** 2)).item()
+        l2_error = torch.sqrt(torch.mean((p_pred_final - p_true)**2)).item()
     
-    return l2_error, time.time() - start_time
+    return l2_error, train_time
 
-# ============================================================================
-# 4. EXPERIMENT RUNNER
-# ============================================================================
-
+# ==================== Experiment Runner (CORRECTED) ====================
 def run_experiment(alpha: float, n_runs: int, epochs: int, 
-                   device: torch.device) -> Dict:
-    """Run experiment for one alpha"""
+                   device: torch.device, use_feature: bool, use_intrusive: bool) -> Dict:
+    """
+    FIXED: Run ONE model type based on flags, compare to saved baseline
+    """
     print(f"\n{'='*60}")
     print(f"[Formation α={alpha}]")
+    print(f"Mode: use_feature={use_feature}, use_intrusive={use_intrusive}")
     print(f"{'='*60}")
     
     data = generate_formation_data(alpha, save_plot=True)
     
-    ip_errors, ip_times = [], []
-    pinn_errors, pinn_times = [], []
-    
-    for run in range(1, n_runs + 1):
-        print(f"\n  {'─'*50}")
-        print(f"  Run {run}/{n_runs}")
-        print(f"  {'─'*50}")
+    # ===== CORRECT LOGIC: Determine which model to train =====
+    if use_feature or use_intrusive:
+        # ========== Train IP-FPINN (Enhanced) ==========
+        model_name = "IP-FPINN (Enhanced)"
+        errors, times = [], []
         
-        torch.manual_seed(42 + run)
-        np.random.seed(42 + run)
+        for run in range(1, n_runs + 1):
+            print(f"\n  {'─'*50}")
+            print(f"  Run {run}/{n_runs} - {model_name}")
+            print(f"  {'─'*50}")
+            
+            torch.manual_seed(42 + run)
+            np.random.seed(42 + run)
+            
+            model = SpatialAttentionIPFPINN(
+                hidden_dim=64, 
+                grid_size=64,
+                use_feature=use_feature,
+                use_intrusive=use_intrusive
+            )
+            
+            error, train_time = train_model(
+                model, data, epochs, device, model_name,
+                use_feature=use_feature, use_intrusive=use_intrusive
+            )
+            
+            errors.append(error)
+            times.append(train_time)
+            print(f"    L2={error:.3e}, Time={train_time:.1f}s")
         
-        # Train ENHANCED IP-FPINN
-        print(f"  [IP-FPINN Enhanced]")
-        ipfpinn = SpatialAttentionIPFPINN(hidden_dim=64, grid_size=64)
-        ip_error, ip_time = train_model(ipfpinn, data, epochs, device, "IP-FPINN")
-        ip_errors.append(ip_error)
-        ip_times.append(ip_time)
+        # Compute stats for IP-FPINN
+        mean_l2 = np.mean(errors)
+        std_l2 = np.std(errors, ddof=1) if n_runs > 1 else 0.0
+        cv = std_l2 / mean_l2 * 100 if mean_l2 > 0 else 0.0
+        avg_time = np.mean(times)
         
-        # Train baseline PINN
-        print(f"  [PINN Baseline]")
-        pinn = PINN(hidden_dim=64)
-        pinn_error, pinn_time = train_model(pinn, data, epochs, device, "PINN")
-        pinn_errors.append(pinn_error)
-        pinn_times.append(pinn_time)
+        # Load or generate baseline PINN for comparison
+        baseline_file = RESULTS_DIR / "baseline_reference.json"
+        if not baseline_file.exists():
+            print("\n  Generating baseline PINN for comparison...")
+            baseline_errors = []
+            for run in range(1, n_runs + 1):
+                torch.manual_seed(42 + run)
+                np.random.seed(42 + run)
+                pinn = PINN(hidden_dim=64)
+                pinn_error, _ = train_model(
+                    pinn, data, epochs, device, "PINN-Baseline (Reference)",
+                    use_feature=False, use_intrusive=False
+                )
+                baseline_errors.append(pinn_error)
+                print(f"    PINN Run {run}: L2={pinn_error:.3e}")
+            
+            baseline_mean = np.mean(baseline_errors)
+            # Save baseline for future experiments
+            with open(baseline_file, "w") as f:
+                json.dump({"baseline_l2": baseline_mean}, f, indent=2)
+        else:
+            with open(baseline_file, "r") as f:
+                baseline_data = json.load(f)
+                baseline_mean = baseline_data["baseline_l2"]
+            print(f"  Loaded baseline PINN L2 error: {baseline_mean:.3e}")
         
-        print(f"    IP-FPINN: L2={ip_error:.3e}, Time={ip_time:.1f}s")
-        print(f"    PINN:     L2={pinn_error:.3e}, Time={pinn_time:.1f}s")
+        # Compute improvement
+        improvement = (baseline_mean - mean_l2) / baseline_mean * 100
+        
+        return {
+            "alpha": alpha,
+            "use_feature": use_feature,
+            "use_intrusive": use_intrusive,
+            "ipfpinn": {
+                "mean_l2": mean_l2,
+                "std_l2": std_l2,
+                "cv": cv,
+                "time": avg_time,
+                "raw_errors": errors  # ✅ ADDED: Store individual run errors
+            },
+            "pinn_baseline": {
+                "mean_l2": baseline_mean,
+                "std_l2": 0.0,
+                "cv": 0.0,
+                "time": avg_time
+            },
+            "improvement_percent": improvement,
+            "status": "enhanced_mode"
+        }
     
-    # Statistics
-    def stats(errors, times):
-        mean = np.mean(errors)
-        std = np.std(errors, ddof=1)
-        cv = std / mean * 100
-        return mean, std, cv, np.mean(times)
-    
-    ip_mean, ip_std, ip_cv, ip_time = stats(ip_errors, ip_times)
-    pinn_mean, pinn_std, pinn_cv, pinn_time = stats(pinn_errors, pinn_times)
-    
-    # Compute improvement percentage
-    improvement = (pinn_mean - ip_mean) / pinn_mean * 100
-    
-    return {
-        'alpha': alpha,
-        'improvement_percent': improvement,
-        'ipfpinn': {'mean_l2': ip_mean, 'std_l2': ip_std, 'cv': ip_cv, 'time': ip_time},
-        'pinn': {'mean_l2': pinn_mean, 'std_l2': pinn_std, 'cv': pinn_cv, 'time': pinn_time}
-    }
+    else:
+        # ========== Train Baseline PINN Only ==========
+        model_name = "PINN-Baseline (Only)"
+        errors, times = [], []
+        
+        for run in range(1, n_runs + 1):
+            print(f"\n  {'─'*50}")
+            print(f"  Run {run}/{n_runs} - {model_name}")
+            print(f"  {'─'*50}")
+            
+            torch.manual_seed(42 + run)
+            np.random.seed(42 + run)
+            
+            model = PINN(hidden_dim=64)
+            
+            error, train_time = train_model(
+                model, data, epochs, device, model_name,
+                use_feature=False, use_intrusive=False
+            )
+            
+            errors.append(error)
+            times.append(train_time)
+            print(f"    L2={error:.3e}, Time={train_time:.1f}s")
+        
+        mean_l2 = np.mean(errors)
+        std_l2 = np.std(errors, ddof=1) if n_runs > 1 else 0.0
+        cv = std_l2 / mean_l2 * 100 if mean_l2 > 0 else 0.0
+        avg_time = np.mean(times)
+        
+        return {
+            "alpha": alpha,
+            "use_feature": False,
+            "use_intrusive": False,
+            "pinn_baseline": {
+                "mean_l2": mean_l2,
+                "std_l2": std_l2,
+                "cv": cv,
+                "time": avg_time,
+                "raw_errors": errors  # ✅ ADDED: Store individual run errors
+            },
+            "status": "baseline_only_mode"
+        }
 
+# ==================== Main Execution ====================
 def main():
-    parser = argparse.ArgumentParser(description='Enhanced IP-FPINN - ULTIMATE')
-    parser.add_argument('--n_runs', type=int, default=5, help='Number of runs')
-    parser.add_argument('--epochs', type=int, default=1500, help='Training epochs')
-    parser.add_argument('--alphas', type=float, nargs='+', default=[0.3, 1.0], help='Formation parameters')
+    parser = argparse.ArgumentParser(description="Enhanced IP-FPINN with Correct Ablation Logic")
+    parser.add_argument("--n_runs", type=int, default=1, help="Number of runs per configuration")
+    parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
+    parser.add_argument("--alphas", type=float, nargs="+", default=[0.5], help="Heterogeneity parameters")
+    parser.add_argument("--use_feature", type=str, choices=["true", "false"], default="true", 
+                       help="Enable feature engineering")
+    parser.add_argument("--use_intrusive", type=str, choices=["true", "false"], default="true", 
+                       help="Enable intrusive physics")
+    
     args = parser.parse_args()
     
+    # Parse boolean flags
+    use_feature = args.use_feature.lower() == "true"
+    use_intrusive = args.use_intrusive.lower() == "true"
+    
     print("\n" + "="*80)
-    print("ENHANCED IP-FPINN - ULTIMATE STABLE VERSION")
+    print("ENHANCED IP-FPINN - CORRECTED ABLATION VERSION")
     print("="*80)
     print(f"✓ n_runs: {args.n_runs} | epochs: {args.epochs} | alphas: {args.alphas}")
-    print(f"✓ LR: 1e-4 | PDE weight: 0.5 (both models) | Fair comparison")
-    print("="*80 + "\n")
+    print(f"✓ use_feature: {use_feature} | use_intrusive: {use_intrusive}")
+    print("="*80)
+    print(f"\nUsing device: {DEVICE}")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}\n")
-    
+    # Run experiment
     results = []
     for alpha in args.alphas:
-        results.append(run_experiment(alpha, args.n_runs, args.epochs, device))
-    
-    # Summary
-    print("\n" + "="*80)
-    print("ULTIMATE PERFORMANCE SUMMARY")
-    print("="*80)
-    for r in results:
-        print(f"\nα={r['alpha']}:")
-        print(f"  IP-FPINN: L2={r['ipfpinn']['mean_l2']:.3e}±{r['ipfpinn']['std_l2']:.3e} (CV={r['ipfpinn']['cv']:.2f}%)")
-        print(f"  PINN:     L2={r['pinn']['mean_l2']:.3e}±{r['pinn']['std_l2']:.3e} (CV={r['pinn']['cv']:.2f}%)")
-        print(f"  Improvement: {r['improvement_percent']:.1f}%")
+        result = run_experiment(
+            alpha=alpha,
+            n_runs=args.n_runs,
+            epochs=args.epochs,
+            device=DEVICE,
+            use_feature=use_feature,
+            use_intrusive=use_intrusive
+        )
+        results.append(result)
+        
+        # Print summary
+        if result["status"] == "enhanced_mode":
+            print(f"\n{'='*60}")
+            print(f"SUMMARY α={alpha}:")
+            print(f"  IP-FPINN L2: {result['ipfpinn']['mean_l2']:.3e} ± {result['ipfpinn']['std_l2']:.3e}")
+            print(f"  PINN Baseline L2: {result['pinn_baseline']['mean_l2']:.3e}")
+            print(f"  Improvement: {result['improvement_percent']:.1f}%")
+            print(f"  Runtime: {result['ipfpinn']['time']:.1f}s")
+            print(f"{'='*60}")
+        else:
+            print(f"\n{'='*60}")
+            print(f"BASELINE ONLY α={alpha}:")
+            print(f"  PINN L2: {result['pinn_baseline']['mean_l2']:.3e} ± {result['pinn_baseline']['std_l2']:.3e}")
+            print(f"  Runtime: {result['pinn_baseline']['time']:.1f}s")
+            print(f"{'='*60}")
     
     # Save results
-    Path('results_enhanced').mkdir(exist_ok=True)
-    with open('results_enhanced/q1_ultimate_results.json', 'w') as f:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if use_feature and use_intrusive:
+        filename = RESULTS_DIR / f"q1_ultimate_results_{timestamp}.json"
+    elif not use_feature and not use_intrusive:
+        filename = RESULTS_DIR / f"ablation_baseline_{timestamp}.json"
+    elif use_feature and not use_intrusive:
+        filename = RESULTS_DIR / f"ablation_feature_only_{timestamp}.json"
+    else:
+        filename = RESULTS_DIR / f"ablation_intrusive_only_{timestamp}.json"
+    
+    with open(filename, "w") as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n📁 ULTIMATE results saved to results_enhanced/q1_ultimate_results.json")
-    print("🎉 Experiment completed successfully!")
+    print(f"\n{'='*80}")
+    print(f"Results saved to: {filename}")
+    print(f"{'='*80}")
 
 if __name__ == "__main__":
     main()

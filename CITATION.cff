@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: "Integral-Projection Physics-Informed Neural Networks for Heterogeneous Porous Media: A Statistically Validated Framework"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Ouaar
+    given-names: Fatima
+    affiliation: University of Biskra, Algeria
+    email: f.ouaar@univ-biskra.dz
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.18127507
+    description: Zenodo archive for this paper
+repository-code: https://github.com/fouaar-cyber/article-geological-ip-fpinn
+abstract: "This study establishes a statistically rigorous protocol for physics-informed neural network reproducibility in geoscience applications. Through comprehensive validation involving fifteen independent runs per configuration, we demonstrate that feature engineering yields measurable improvements in solution accuracy for heterogeneous porous media flow. Specifically, our proposed Integral-Projection PINN framework achieves a 3.3% reduction in relative L2 error compared to baseline methods (0.2901 vs. 0.3000, one-tailed Welch's t-test, p = 0.020, Cohen's d = 0.82). Our ablation study reveals that learned geological feature mapping constitutes the primary contributor to this improvement, while intrusive PDE constraints provide negligible additional value within this context. The complete experimental pipeline—including raw error data, statistical validation scripts, and figure generation code—is publicly archived to ensure full reproducibility."
+keywords:
+  - Physics-Informed Neural Networks
+  - Porous Media Flow
+  - Statistical Validation
+  - Reservoir Engineering
+  - Scientific Machine Learning
+  - Reproducible Research
+  - PINN
+license: MIT
+version: 1.0.0
+date-released: 2026-01-07

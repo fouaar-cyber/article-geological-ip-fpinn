@@ -1,33 +1,61 @@
-# Python
+# .gitignore
+# Byte-compiled / optimized / DLL files
 __pycache__/
+*.py[cod]
+*$py.class
 *.pyc
-*.pyo
-*.pyd
-.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Unit test / coverage reports
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Environments
+.env
+.venv/
 env/
 venv/
-.pip-log.txt
+ENV/
 
-# Data files (too large for Git)
-data/
-*.npy
-*.h5
-
-# Results (you can commit these if small)
-results/
-
-#IDE
+# IDE
 .vscode/
 .idea/
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+
+# Debug artifacts
 debug_plots_enhanced/
+
+# LaTeX auxiliary files (build artifacts)
 *.aux
-*.log
+*.bbl
 *.blg
+*.log
 *.out
 *.synctex.gz
-*.docx
-Nouveau*.txt
+*.toc
+*.fdb_latexmk
+*.fls
+
+# Whitelist CRITICAL reproducibility files
+!results_enhanced/
+!results_enhanced/*.json
+!paper/figs/
+!paper/figs/*.png
+!paper/
+!paper/*.tex
+!paper/*.pdf
+!paper/*.cls
+!paper/*.bst
+!paper/*.bib
+!CITATION.cff
+!LICENSE
+!requirements.txt
+!.gitignore

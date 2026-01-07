@@ -1,6 +1,0 @@
-name: geological-ip-fpinn
-dependencies:
-  - python=3.9
-  - numpy
-  - scipy
-  - pytorch
