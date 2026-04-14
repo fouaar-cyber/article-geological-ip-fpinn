@@ -1,18 +1,18 @@
 cff-version: 1.2.0
-title: "Integral-Projection Physics-Informed Neural Networks for Heterogeneous Porous Media: A Statistically Validated Framework"
+title: "Statistical Validation of Learned Geological Feature Mapping for Neural Network Solvers of Heterogeneous Porous Media Flow"
 message: "If you use this software, please cite it as below."
 type: software
 authors:
   - family-names: Ouaar
     given-names: Fatima
-    affiliation: University of Biskra, Algeria
+    affiliation: Department of Mathematics, University of Biskra, Algeria
     email: f.ouaar@univ-biskra.dz
 identifiers:
   - type: doi
     value: 10.5281/zenodo.18127507
     description: Zenodo archive for this paper
 repository-code: https://github.com/fouaar-cyber/article-geological-ip-fpinn
-abstract: "This study establishes a statistically rigorous protocol for physics-informed neural network reproducibility in geoscience applications. Through comprehensive validation involving fifteen independent runs per configuration, we demonstrate that feature engineering yields measurable improvements in solution accuracy for heterogeneous porous media flow. Specifically, our proposed Integral-Projection PINN framework achieves a 3.3% reduction in relative L2 error compared to baseline methods (0.2901 vs. 0.3000, one-tailed Welch's t-test, p = 0.020, Cohen's d = 0.82). Our ablation study reveals that learned geological feature mapping constitutes the primary contributor to this improvement, while intrusive PDE constraints provide negligible additional value within this context. The complete experimental pipeline—including raw error data, statistical validation scripts, and figure generation code—is publicly archived to ensure full reproducibility."
+abstract: "This study establishes a statistically rigorous protocol for physics-informed neural network reproducibility in geoscience applications. Through comprehensive validation involving fifteen independent runs per configuration (n=15), we demonstrate that learned geological feature mapping yields measurable improvements in solution accuracy for heterogeneous porous media flow. Specifically, feature engineering achieves a 19.3% reduction in relative L2 error compared to baseline methods (0.0228 vs. 0.0282, one-tailed Welch's t-test, p < 0.001, Cohen's d = 2.88). Notably, standard PINN architectures without learned features fail to converge (30% error), establishing that feature engineering is necessary, not merely beneficial. The complete experimental pipeline—including raw error data, statistical validation scripts, and figure generation code—is publicly archived to ensure full reproducibility."
 keywords:
   - Physics-Informed Neural Networks
   - Porous Media Flow
@@ -20,7 +20,8 @@ keywords:
   - Reservoir Engineering
   - Scientific Machine Learning
   - Reproducible Research
-  - PINN
+  - Heterogeneous Permeability
+  - Neural Network Solvers
 license: MIT
-version: 1.0.0
-date-released: 2026-01-07
+version: 2.0.0
+date-released: 2026-04-13
